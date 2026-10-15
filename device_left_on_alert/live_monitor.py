@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -17,6 +18,111 @@ from settings import (
     POWER_LIMIT, TIME_LIMIT, MAX_GAP, INFLUX_URL, ORG, BUCKET,
     POLL_SECONDS, GRAFANA_URL, GRAFANA_DASHBOARD_UID,
 )
+
+
+# The RGB alarm stays red until Shelly reports the device is OFF.
+# Use a lower OFF limit so a small power dip does not cancel the alarm.
+OFF_POWER_LIMIT = 1.0       # watts
+OFF_CONFIRM_READINGS = 2   # consecutive fresh measurements
+FUTURE_SKEW_SECONDS = 5   # accept a small clock difference
+STATE_FILE = Path(__file__).with_name(".rgb_alert_state")
+
+
+def get_rgb_panel():
+    """Get the 8x8 Sense HAT LED panel if it is available."""
+    try:
+        from sense_hat import SenseHat
+        return SenseHat()
+    except (ImportError, OSError, RuntimeError) as error:
+        print("Sense HAT not available:", type(error).__name__, flush=True)
+        return None
+
+
+def show_rgb(panel, red):
+    """Turn the panel red, or switch it off."""
+    if panel is None:
+        return False
+    try:
+        if red:
+            panel.clear(255, 0, 0)
+        else:
+            panel.clear()
+        return True
+    except (OSError, RuntimeError) as error:
+        print("Sense HAT error:", type(error).__name__, flush=True)
+        return False
+
+
+class RgbAlarm:
+    """Remember the alert and keep the Sense HAT in sync with it."""
+
+    def __init__(self, panel, state_file=None):
+        self.panel = panel
+        self.state_file = Path(state_file) if state_file is not None else STATE_FILE
+        self.active = self._load_state()
+        self.off_readings = 0
+        self.needs_sync = True
+        self.sync_panel()
+
+    def _load_state(self):
+        try:
+            saved = self.state_file.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            print("Warning: cannot read RGB state; keeping the warning ON.", flush=True)
+            return True
+        if saved not in ("0", "1"):
+            print("Warning: unknown RGB state; keeping the warning ON.", flush=True)
+            return True
+        return saved == "1"
+
+    def _save_state(self):
+        """Save only 0 or 1. No tokens or power measurements are stored."""
+        temp_file = self.state_file.with_name(self.state_file.name + ".tmp")
+        try:
+            temp_file.write_text("1" if self.active else "0", encoding="ascii")
+            temp_file.replace(self.state_file)
+        except OSError as error:
+            print("Warning: cannot save RGB state:", type(error).__name__, flush=True)
+
+    def sync_panel(self):
+        """Keep red lit, and retry a failed switch-off on the next poll."""
+        if self.active or self.needs_sync:
+            self.needs_sync = not show_rgb(self.panel, self.active)
+        return not self.needs_sync
+
+    def start_alert(self):
+        self.active = True
+        self.off_readings = 0
+        self._save_state()
+        self.needs_sync = True
+        return self.sync_panel()
+
+    def check_off(self, power, fresh, continuous, after_start):
+        """Clear only after two NEW, fresh, consecutive <=1 W readings."""
+        if not self.active:
+            return False
+        if not (fresh and continuous and after_start):
+            self.off_readings = 0
+        elif power <= OFF_POWER_LIMIT:
+            self.off_readings += 1
+            if self.off_readings >= OFF_CONFIRM_READINGS:
+                self.active = False
+                self.off_readings = 0
+                self._save_state()
+                self.needs_sync = True
+                self.sync_panel()
+                return True
+        else:
+            self.off_readings = 0
+        return False
+
+
+def is_fresh_sample(timestamp):
+    """Reject stale readings and timestamps far in the future."""
+    age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    return -FUTURE_SKEW_SECONDS <= age <= MAX_GAP
 
 
 def read_influx(token):
@@ -126,6 +232,7 @@ def run(once=False):
 
     checker = DeviceChecker()
     started_at = datetime.now(timezone.utc)
+    rgb_alarm = RgbAlarm(get_rgb_panel()) if not once else None
     print("Reading Shelly power from InfluxDB. Press Ctrl+C to stop.", flush=True)
     if not grafana_token and not once:
         print("Grafana markers disabled (GRAFANA_TOKEN not set).", flush=True)
@@ -146,10 +253,28 @@ def run(once=False):
                 if checker.last_time is not None and timestamp <= checker.last_time:
                     continue
                 new_count += 1
-                # Alert only on a fresh sample, not on old stored history.
-                fresh = (datetime.now(timezone.utc) - timestamp).total_seconds() <= MAX_GAP
-                if checker.check(timestamp, power, allow_alert=timestamp >= started_at and fresh):
+                # Cached samples can warm up DeviceChecker, but must not clear RGB.
+                fresh = is_fresh_sample(timestamp)
+                gap = ((timestamp - checker.last_time).total_seconds()
+                       if checker.last_time is not None else 0)
+                continuous = checker.last_time is None or 0 < gap <= MAX_GAP
+                if rgb_alarm.check_off(power, fresh, continuous, timestamp >= started_at):
+                    if rgb_alarm.needs_sync:
+                        print("Device OFF confirmed; RGB switch-off will be retried.", flush=True)
+                    else:
+                        print("Device OFF: RGB warning cleared.", flush=True)
+
+                # DeviceChecker still handles the 8 W / 10 min detection.
+                new_alert = checker.check(
+                    timestamp, power, allow_alert=timestamp >= started_at and fresh
+                )
+                if new_alert and not rgb_alarm.active:
+                    rgb_ok = rgb_alarm.start_alert()
                     print("ALERT: Device may have been left ON!", flush=True)
+                    if rgb_ok:
+                        print("RGB panel: RED until device is OFF.", flush=True)
+                    else:
+                        print("RGB panel unavailable; Terminal alert works.", flush=True)
                     print("Time:", timestamp, "Power:", power, "W", flush=True)
                     save_alert(timestamp, power)
                     if grafana_token:
@@ -170,6 +295,8 @@ def run(once=False):
             else:
                 print("No apower readings found in InfluxDB.", flush=True)
 
+            # Reassert red even when no new readings arrive. Never clear on data loss.
+            rgb_alarm.sync_panel()
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
             print("Stopped.")
@@ -178,11 +305,13 @@ def run(once=False):
             print("InfluxDB HTTP", error.code, "- check token, org and bucket.", flush=True)
             if once:
                 return 2
+            rgb_alarm.sync_panel()
             time.sleep(POLL_SECONDS)
         except (URLError, OSError, ValueError) as error:
             print("Cannot read InfluxDB:", type(error).__name__, flush=True)
             if once:
                 return 2
+            rgb_alarm.sync_panel()
             time.sleep(POLL_SECONDS)
 
 
